@@ -1,0 +1,6 @@
+{
+  "remainingStations": 7,
+  "motionThreshold": 2000,
+  "calmThreshold": 1500,
+  "sampleWindow": 10
+}

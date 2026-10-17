@@ -1,0 +1,542 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>近くの駅マップ（修正版）</title>
+    
+    <!-- 1. 最初にLeafletのスタイルシートを読み込む -->
+    <link
+        rel="stylesheet"
+        href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+        crossorigin=""
+    />
+
+    <!-- 2. 次にLeafletの本体プログラム(JS)を読み込む（これで L が定義されます） -->
+    <script
+        src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+        crossorigin=""
+    ></script>
+
+    <style>
+        body { font-family: sans-serif; margin: 20px; }
+        #map { height: 550px; width: 100%; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.2); }
+        .loading { color: #666; font-style: italic; }
+        #communicationLog { box-sizing: border-box; width: 100%; min-height: 180px; max-height: 320px; overflow: auto; padding: 10px; background: #111; color: #d8f3dc; white-space: pre-wrap; overflow-wrap: anywhere; }
+    </style>
+</head>
+<body>
+
+    <h2>📍 あなたの近くの駅マップ</h2>
+    <p id="status" class="loading">位置情報を取得中...</p>
+
+    <div style="margin: 12px 0; display: flex; gap: 10px; flex-wrap: wrap;">
+        <button id="connectMicrobitBtn" type="button">micro:bitに接続</button>
+        <button id="sendStationBtn" type="button" disabled>最寄り駅を送信</button>
+    </div>
+    <p id="microbitStatus" class="loading">micro:bit未接続</p>
+
+    <section aria-labelledby="configHeading" style="margin: 16px 0; max-width: 640px;">
+        <h3 id="configHeading">micro:bit 設定</h3>
+        <input id="configFileInput" type="file" accept=".json,application/json" aria-label="設定JSONファイルを選択">
+        <textarea id="configEditor" rows="8" spellcheck="false" style="display: block; box-sizing: border-box; width: 100%; margin: 8px 0; font-family: monospace;">{
+  "remainingStations": 7,
+  "motionThreshold": 2000,
+  "calmThreshold": 1500,
+  "sampleWindow": 10
+}</textarea>
+        <button id="downloadConfigBtn" type="button">設定JSONを保存</button>
+        <button id="sendConfigBtn" type="button" disabled>設定をmicro:bitに送信</button>
+        <p id="configStatus" class="loading" aria-live="polite">設定JSONを読み込むか、編集してください。</p>
+    </section>
+
+    <section aria-labelledby="communicationLogHeading" style="margin: 16px 0;">
+        <h3 id="communicationLogHeading">Bluetooth通信ログ</h3>
+        <button id="clearCommunicationLogBtn" type="button">ログを消去</button>
+        <pre id="communicationLog" aria-live="polite"></pre>
+    </section>
+
+    <div id="map"></div>
+
+    <!-- 3. 最後に自分のJavaScriptを実行する -->
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            const statusText = document.getElementById('status');
+            const microbitStatus = document.getElementById('microbitStatus');
+            const connectMicrobitBtn = document.getElementById('connectMicrobitBtn');
+            const sendStationBtn = document.getElementById('sendStationBtn');
+            const configFileInput = document.getElementById('configFileInput');
+            const configEditor = document.getElementById('configEditor');
+            const downloadConfigBtn = document.getElementById('downloadConfigBtn');
+            const sendConfigBtn = document.getElementById('sendConfigBtn');
+            const configStatus = document.getElementById('configStatus');
+            const communicationLog = document.getElementById('communicationLog');
+            const clearCommunicationLogBtn = document.getElementById('clearCommunicationLogBtn');
+
+            let currentPosition = null;
+            let nearestStation = null;
+            let microbitCharacteristic = null;
+            let microbitNotifyCharacteristic = null;
+            let receiveDecoder = new TextDecoder();
+            let receiveBuffer = '';
+            let kuroshiroPromise = null;
+
+            if (!window.L) {
+                statusText.textContent = '地図ライブラリの読み込みに失敗しました。ページを再読込してください。';
+                return;
+            }
+
+            connectMicrobitBtn.addEventListener('click', connectToMicrobit);
+            configFileInput.addEventListener('change', loadConfigFile);
+            downloadConfigBtn.addEventListener('click', downloadConfigFile);
+            sendConfigBtn.addEventListener('click', sendConfig);
+            clearCommunicationLogBtn.addEventListener('click', () => {
+                communicationLog.textContent = '';
+            });
+            sendStationBtn.addEventListener('click', () => {
+                if (!nearestStation) {
+                    microbitStatus.textContent = '50m以内に送信対象の駅がありません。';
+                    return;
+                }
+                sendStationName(nearestStation.sendName);
+            });
+
+            if (navigator.geolocation) {
+                navigator.geolocation.getCurrentPosition(successLocation, errorLocation);
+            } else {
+                statusText.textContent = 'お使いのブラウザは位置情報に対応していません。';
+            }
+
+            function successLocation(position) {
+                const lat = position.coords.latitude;
+                const lng = position.coords.longitude;
+                currentPosition = { lat, lng };
+
+                statusText.textContent = '周辺の駅を検索中...';
+
+                const map = L.map('map').setView([lat, lng], 14);
+
+                L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                    attribution: '&copy; <a href="https://openstreetmap.org">OpenStreetMap</a>'
+                }).addTo(map);
+
+                L.circleMarker([lat, lng], { color: 'blue', radius: 10 }).addTo(map)
+                    .bindPopup('<b>現在地</b>').openPopup();
+
+                const displayRadius = 1500;
+                const sendRadius = 50;
+
+                fetchNearbyStations(lat, lng, displayRadius)
+                    .then(stations => {
+                        nearestStation = stations.find(station => station.distance <= sendRadius) || null;
+
+                        statusText.textContent = `半径${displayRadius}m以内の駅を${stations.length}件表示中。`;
+
+                        if (nearestStation) {
+                            statusText.textContent += ` 送信対象（${sendRadius}m以内）: ${nearestStation.name}`;
+                        } else {
+                            statusText.textContent += ` ${sendRadius}m以内に送信対象の駅はありません。`;
+                        }
+
+                        stations.forEach(station => {
+                            L.marker([station.lat, station.lon]).addTo(map)
+                                .bindPopup(`<b>🚉 ${station.name}</b>`);
+                        });
+
+                        if (nearestStation && microbitCharacteristic) {
+                            sendStationName(nearestStation.sendName);
+                        }
+                    })
+                    .catch(error => {
+                        console.error(error);
+                        statusText.textContent = '駅情報の取得に失敗しました。しばらくしてから再試行してください。';
+                    });
+            }
+
+            async function fetchNearbyStations(lat, lng, radius) {
+                const latitudeDelta = radius / 111320;
+                const longitudeDelta = radius / (111320 * Math.cos(lat * Math.PI / 180));
+                const params = new URLSearchParams({
+                    format: 'jsonv2',
+                    q: 'railway=station',
+                    viewbox: [lng - longitudeDelta, lat + latitudeDelta, lng + longitudeDelta, lat - latitudeDelta].join(','),
+                    bounded: '1',
+                    limit: '50',
+                    'accept-language': 'ja',
+                    namedetails: '1'
+                });
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 15000);
+
+                try {
+                    const response = await fetch(`https://nominatim.openstreetmap.org/search?${params}`, {
+                        signal: controller.signal
+                    });
+                    if (!response.ok) {
+                        throw new Error(`OpenStreetMap検索エラー: ${response.status}`);
+                    }
+
+                    const data = await response.json();
+                    return data
+                        .map(station => {
+                            if (station.category !== 'railway' || station.type !== 'station') return null;
+                            const stationLat = Number(station.lat);
+                            const stationLon = Number(station.lon);
+                            const distance = getDistanceMeters(lat, lng, stationLat, stationLon);
+                            if (distance > radius) return null;
+
+                            const name = station.name || '名前のない駅';
+                            return {
+                                name,
+                                sendName: station.namedetails?.['name:ja-Hira']
+                                    || station.namedetails?.['name:ja-Hrkt']
+                                    || name,
+                                lat: stationLat,
+                                lon: stationLon,
+                                distance
+                            };
+                        })
+                        .filter(station => station && station.distance <= radius)
+                        .sort((a, b) => a.distance - b.distance);
+                } finally {
+                    clearTimeout(timeoutId);
+                }
+            }
+
+            function errorLocation() {
+                statusText.textContent = '位置情報の取得が拒否されたか、取得できませんでした。ブラウザの位置情報設定を許可してください。';
+            }
+
+            function getDistanceMeters(lat1, lon1, lat2, lon2) {
+                const toRad = (value) => value * Math.PI / 180;
+                const earthRadius = 6371000;
+                const dLat = toRad(lat2 - lat1);
+                const dLon = toRad(lon2 - lon1);
+                const a = Math.sin(dLat / 2) * Math.sin(dLat / 2)
+                    + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2))
+                    * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+                return 2 * earthRadius * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+            }
+
+            async function connectToMicrobit() {
+                if (!navigator.bluetooth) {
+                    microbitStatus.textContent = 'このブラウザは Web Bluetooth に対応していません。Chrome / Edge を使ってください。';
+                    return;
+                }
+
+                try {
+                    microbitStatus.textContent = 'micro:bitを検索中...';
+
+                    const requestOptions = {
+                        filters: [{ namePrefix: 'BBC micro:bit' }],
+                        optionalServices: ['6e400001-b5a3-f393-e0a9-e50e24dcca9e']
+                    };
+
+                    const device = await navigator.bluetooth.requestDevice(requestOptions);
+
+                    device.addEventListener('gattserverdisconnected', () => {
+                        microbitCharacteristic = null;
+                        microbitNotifyCharacteristic = null;
+                        sendStationBtn.disabled = true;
+                        sendConfigBtn.disabled = true;
+                        microbitStatus.textContent = 'micro:bitとの接続が切れました。';
+                    });
+
+                    const server = await device.gatt.connect();
+                    const service = await server.getPrimaryService('6e400001-b5a3-f393-e0a9-e50e24dcca9e');
+                    const characteristics = await service.getCharacteristics();
+                    console.log('micro:bit UART characteristics:', characteristics.map(c => ({
+                        uuid: c.uuid,
+                        write: c.properties.write,
+                        writeWithoutResponse: c.properties.writeWithoutResponse,
+                        notify: c.properties.notify,
+                        indicate: c.properties.indicate
+                    })));
+
+                    const writableCharacteristic = characteristics.find(characteristic =>
+                        characteristic.properties.write || characteristic.properties.writeWithoutResponse
+                    );
+                    const notifyCharacteristic = characteristics.find(characteristic =>
+                        characteristic.properties.notify || characteristic.properties.indicate
+                    );
+
+                    if (!writableCharacteristic) {
+                        microbitStatus.textContent = 'micro:bitの UART 書き込み可能な特性が見つかりません。MakeCodeのBluetooth UART設定を確認してください。';
+                        return;
+                    }
+
+                    microbitCharacteristic = writableCharacteristic;
+                    microbitNotifyCharacteristic = notifyCharacteristic || null;
+                    microbitStatus.textContent = `micro:bitに接続しました: ${device.name || 'unknown'}`;
+                    sendStationBtn.disabled = false;
+                    sendConfigBtn.disabled = false;
+
+                    if (microbitNotifyCharacteristic) {
+                        await startMicrobitNotifications(microbitNotifyCharacteristic);
+                    } else {
+                        logCommunication('INFO', '受信用の通知特性が見つかりません。micro:bitからの受信は利用できません。');
+                    }
+
+                    if (nearestStation) {
+                        sendStationName(nearestStation.sendName);
+                    }
+                } catch (error) {
+                    if (error && error.name === 'NotFoundError') {
+                        microbitStatus.textContent = 'micro:bitの接続をキャンセルしました。再度接続する場合はボタンを押してください。';
+                        sendStationBtn.disabled = true;
+                        sendConfigBtn.disabled = true;
+                        return;
+                    }
+
+                    console.error(error);
+                    microbitStatus.textContent = 'micro:bitが見つかりませんでした。Bluetoothがオンか、Chrome / Edge で localhost を開いているか確認してください。';
+                }
+            }
+
+            async function loadConfigFile(event) {
+                const file = event.target.files && event.target.files[0];
+                if (!file) {
+                    return;
+                }
+
+                try {
+                    const text = await file.text();
+                    JSON.parse(text);
+                    configEditor.value = text;
+                    configStatus.textContent = `${file.name} を読み込みました。内容を確認して送信してください。`;
+                } catch (error) {
+                    configStatus.textContent = 'JSONを読み込めません。設定ファイルの形式を確認してください。';
+                }
+            }
+
+            function downloadConfigFile() {
+                try {
+                    const config = parseConfigEditor();
+                    const blob = new Blob([`${JSON.stringify(config, null, 2)}\n`], { type: 'application/json' });
+                    const url = URL.createObjectURL(blob);
+                    const link = document.createElement('a');
+                    link.href = url;
+                    link.download = 'microbit-config.json';
+                    link.click();
+                    URL.revokeObjectURL(url);
+                    configStatus.textContent = '設定JSONを保存しました。';
+                } catch (error) {
+                    configStatus.textContent = error.message;
+                }
+            }
+
+            function parseConfigEditor() {
+                const config = JSON.parse(configEditor.value);
+                const fields = ['remainingStations', 'motionThreshold', 'calmThreshold', 'sampleWindow'];
+                for (const field of fields) {
+                    if (!Number.isInteger(config[field])) {
+                        throw new Error(`${field} は整数で指定してください。`);
+                    }
+                }
+                if (config.remainingStations < 0 || config.remainingStations > 99
+                    || config.motionThreshold < 1 || config.motionThreshold > 10000
+                    || config.calmThreshold < 0 || config.calmThreshold >= config.motionThreshold
+                    || config.sampleWindow < 1 || config.sampleWindow > 20) {
+                    throw new Error('設定値が範囲外です。しきい値は calmThreshold < motionThreshold にしてください。');
+                }
+                return config;
+            }
+
+            async function sendConfig() {
+                if (!microbitCharacteristic) {
+                    configStatus.textContent = '先にmicro:bitへ接続してください。';
+                    return;
+                }
+
+                try {
+                    const config = parseConfigEditor();
+                    const packet = `CFG,${config.remainingStations},${config.motionThreshold},${config.calmThreshold},${config.sampleWindow}\n`;
+                    const bytes = new TextEncoder().encode(packet);
+                    if (bytes.length > 20) {
+                        throw new Error('設定データがBLEの1回の送信上限を超えています。');
+                    }
+                    await writeUartBytes(bytes);
+                    configStatus.textContent = `設定を送信しました (${bytes.length} bytes)。MakeCode側のCFG受信処理が必要です。`;
+                } catch (error) {
+                    configStatus.textContent = error.message || '設定の送信に失敗しました。';
+                }
+            }
+
+            function logCommunication(direction, value) {
+                const timestamp = new Date().toLocaleTimeString('ja-JP', { hour12: false });
+                if (typeof value === 'string') {
+                    communicationLog.textContent += `[${timestamp}] ${direction} ${value}\n`;
+                } else {
+                    const bytes = value instanceof Uint8Array ? value : new Uint8Array(value);
+                    const text = new TextDecoder().decode(bytes);
+                    const hex = Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join(' ');
+                    communicationLog.textContent += `[${timestamp}] ${direction} ${JSON.stringify(text)} | ${hex}\n`;
+                }
+                communicationLog.scrollTop = communicationLog.scrollHeight;
+            }
+
+            async function writeUartBytes(bytes) {
+                try {
+                    if (microbitCharacteristic.properties.writeWithoutResponse) {
+                        await microbitCharacteristic.writeValueWithoutResponse(bytes);
+                    } else if (microbitCharacteristic.properties.write) {
+                        await microbitCharacteristic.writeValue(bytes);
+                    } else {
+                        throw new DOMException('This characteristic does not support writing.', 'NotSupportedError');
+                    }
+                    logCommunication('TX', bytes);
+                } catch (error) {
+                    logCommunication('TX ERROR', error.message || String(error));
+                    throw error;
+                }
+            }
+
+            async function sendStationName(stationName) {
+                if (!microbitCharacteristic) {
+                    microbitStatus.textContent = 'micro:bitが接続されていません。';
+                    return;
+                }
+                const sourceName = (stationName || nearestStation?.name || '名前のない駅').replace(/\s+/g, ' ').trim();
+                microbitStatus.textContent = '駅名を半角カタカナに変換中...';
+
+                try {
+                    const kuroshiro = await getKuroshiro();
+                    const katakanaName = await kuroshiro.convert(sourceName, { to: 'katakana', mode: 'normal' });
+                    if (/\p{Script=Han}/u.test(katakanaName)) {
+                        throw new Error('駅名の漢字を読み仮名に変換できませんでした。');
+                    }
+
+                const halfWidthKana = {
+                    '。': '｡', '「': '｢', '」': '｣', '、': '､', '・': '･',
+                    'ヲ': 'ｦ', 'ァ': 'ｧ', 'ィ': 'ｨ', 'ゥ': 'ｩ', 'ェ': 'ｪ', 'ォ': 'ｫ',
+                    'ャ': 'ｬ', 'ュ': 'ｭ', 'ョ': 'ｮ', 'ッ': 'ｯ',
+                    'ー': 'ｰ', 'ア': 'ｱ', 'イ': 'ｲ', 'ウ': 'ｳ', 'エ': 'ｴ', 'オ': 'ｵ',
+                    'カ': 'ｶ', 'キ': 'ｷ', 'ク': 'ｸ', 'ケ': 'ｹ', 'コ': 'ｺ',
+                    'サ': 'ｻ', 'シ': 'ｼ', 'ス': 'ｽ', 'セ': 'ｾ', 'ソ': 'ｿ',
+                    'タ': 'ﾀ', 'チ': 'ﾁ', 'ツ': 'ﾂ', 'テ': 'ﾃ', 'ト': 'ﾄ',
+                    'ナ': 'ﾅ', 'ニ': 'ﾆ', 'ヌ': 'ﾇ', 'ネ': 'ﾈ', 'ノ': 'ﾉ',
+                    'ハ': 'ﾊ', 'ヒ': 'ﾋ', 'フ': 'ﾌ', 'ヘ': 'ﾍ', 'ホ': 'ﾎ',
+                    'マ': 'ﾏ', 'ミ': 'ﾐ', 'ム': 'ﾑ', 'メ': 'ﾒ', 'モ': 'ﾓ',
+                    'ヤ': 'ﾔ', 'ユ': 'ﾕ', 'ヨ': 'ﾖ', 'ラ': 'ﾗ', 'リ': 'ﾘ',
+                    'ル': 'ﾙ', 'レ': 'ﾚ', 'ロ': 'ﾛ', 'ワ': 'ﾜ', 'ン': 'ﾝ',
+                    'ヵ': 'ｶ', 'ヶ': 'ｹ', 'ﾞ': 'ﾞ', 'ﾟ': 'ﾟ'
+                };
+                const encoder = new TextEncoder();
+                let payload = '';
+                let chunk = '';
+                const chunks = [];
+                for (const character of katakanaName) {
+                    const codePoint = character.codePointAt(0);
+                    const decomposed = character.normalize('NFD');
+                    const halfWidthCharacter = Array.from(decomposed, part => {
+                        if (part === '\u3099') return 'ﾞ';
+                        if (part === '\u309a') return 'ﾟ';
+                        return halfWidthKana[part] || part;
+                    }).join('');
+                    if (encoder.encode(chunk + halfWidthCharacter).length > 19) {
+                        chunks.push(chunk);
+                        chunk = '';
+                    }
+                    chunk += halfWidthCharacter;
+                    payload += halfWidthCharacter;
+                }
+
+                if (chunk) chunks.push(chunk);
+                if (!chunks.length) chunks.push('ｴｷﾅｼ');
+
+                for (let index = 0; index < chunks.length; index++) {
+                    const isLastChunk = index === chunks.length - 1;
+                    const bytes = encoder.encode(chunks[index] + (isLastChunk ? '\n' : ''));
+                    if (bytes.length > 20) {
+                        throw new Error('駅名データがBLEの1回の送信上限を超えています。');
+                    }
+                    await writeUartBytes(bytes);
+                    if (!isLastChunk) {
+                        await new Promise(resolve => setTimeout(resolve, 30));
+                    }
+                }
+
+                    microbitStatus.textContent = `micro:bitへ送信: ${payload || 'ｴｷﾅｼ'}`;
+                } catch (error) {
+                    console.error(error);
+                    microbitStatus.textContent = error.message || '駅名の変換またはmicro:bitへの送信に失敗しました。';
+                }
+            }
+
+            async function getKuroshiro() {
+                if (!kuroshiroPromise) {
+                    kuroshiroPromise = (async () => {
+                        await loadScript('https://cdn.jsdelivr.net/npm/kuroshiro@1.2.1/dist/kuroshiro.min.js');
+                        await loadScript('https://cdn.jsdelivr.net/npm/kuroshiro-analyzer-kuromoji@1.1.0/dist/kuroshiro-analyzer-kuromoji.min.js');
+                        if (!window.Kuroshiro || !window.KuromojiAnalyzer) {
+                            throw new Error('かな変換ライブラリを読み込めませんでした。ネットワークを確認してください。');
+                        }
+
+                        const kuroshiro = new window.Kuroshiro();
+                        const analyzer = new window.KuromojiAnalyzer({
+                            dictPath: 'https://cdn.jsdelivr.net/npm/kuromoji@0.1.2/dict/'
+                        });
+                        await kuroshiro.init(analyzer);
+                        return kuroshiro;
+                    })().catch(error => {
+                        kuroshiroPromise = null;
+                        throw error;
+                    });
+                }
+                return kuroshiroPromise;
+            }
+
+            function loadScript(src) {
+                return new Promise((resolve, reject) => {
+                    const script = document.createElement('script');
+                    script.src = src;
+                    script.onload = resolve;
+                    script.onerror = () => reject(new Error('かな変換ライブラリを読み込めませんでした。ネットワークを確認してください。'));
+                    document.head.appendChild(script);
+                });
+            }
+
+            async function startMicrobitNotifications(characteristic) {
+                try {
+                    receiveDecoder = new TextDecoder();
+                    receiveBuffer = '';
+                    characteristic.addEventListener('characteristicvaluechanged', event => {
+                        const dataView = event.target.value;
+                        const bytes = new Uint8Array(dataView.buffer, dataView.byteOffset, dataView.byteLength);
+                        logCommunication('RX', bytes);
+
+                        receiveBuffer += receiveDecoder.decode(bytes, { stream: true });
+                        let newlineIndex = receiveBuffer.indexOf('\n');
+                        while (newlineIndex !== -1) {
+                            const line = receiveBuffer.slice(0, newlineIndex).replace(/\r$/, '');
+                            receiveBuffer = receiveBuffer.slice(newlineIndex + 1);
+                            logCommunication('RX LINE', JSON.stringify(line));
+                            handleMicrobitLine(line.trim());
+                            newlineIndex = receiveBuffer.indexOf('\n');
+                        }
+                    });
+                    await characteristic.startNotifications();
+                    logCommunication('INFO', 'micro:bitからのUART受信を開始しました。');
+                } catch (error) {
+                    console.error(error);
+                    logCommunication('RX ERROR', error.message || String(error));
+                    microbitStatus.textContent = 'micro:bitからの受信を開始できませんでした。';
+                }
+            }
+
+            function handleMicrobitLine(command) {
+                microbitStatus.textContent = `micro:bitから受信: ${command}`;
+                if (command === 'where') {
+                    if (!nearestStation) {
+                        microbitStatus.textContent = '50m以内に送信対象の駅がありません。';
+                        return;
+                    }
+                    sendStationName(nearestStation.sendName);
+                }
+            }
+        });
+    </script>
+</body>
+</html>
